@@ -147,9 +147,22 @@ Use these inside a user's forum topic:
 /waiting
 /close
 /note User is waiting for payment confirmation.
+/delete
+/cancel_delete <conversation_id>
+/confirm_delete <conversation_id>
 ```
 
 Notes stay inside the admin topic and are never sent to the user.
+
+Every new conversation topic gets one internal control panel:
+
+```text
+⚙️ CONVERSATION CONTROLS
+
+Delete Conversation: /delete
+```
+
+This is command-based because the relay is a Telegram user account, not a BotFather bot. Telegram inline callback buttons are a bot feature; the userbot cannot reliably send callback buttons. The delete flow still requires confirmation and checks admin authorization before deleting anything.
 
 ## Behavior
 
@@ -159,6 +172,8 @@ Notes stay inside the admin topic and are never sent to the user.
 - User messages remain clean in the admin topic.
 - User identity lives in a pinned profile card that updates over time.
 - Username changes are kept in permanent history.
+- One admin-only control panel is created per topic.
+- `/delete` asks for confirmation before deleting the forum topic and stored conversation data.
 - Admin replies are copied back to the user without admin-group metadata.
 - Duplicate source messages are ignored through the `processed_messages` table.
 - Delivery failures are reported inside the user's admin topic.

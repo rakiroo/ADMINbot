@@ -92,6 +92,7 @@ def init_db() -> None:
               admin_group_id BIGINT NOT NULL,
               message_thread_id BIGINT NOT NULL,
               profile_message_id BIGINT,
+              control_message_id BIGINT,
               status TEXT NOT NULL DEFAULT 'OPEN',
               topic_name TEXT,
               first_contacted TIMESTAMPTZ,
@@ -106,6 +107,7 @@ def init_db() -> None:
             );
 
             ALTER TABLE conversations ADD COLUMN IF NOT EXISTS profile_message_id BIGINT;
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS control_message_id BIGINT;
             ALTER TABLE conversations ADD COLUMN IF NOT EXISTS first_contacted TIMESTAMPTZ;
             ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_active TIMESTAMPTZ;
 
@@ -323,6 +325,32 @@ def add_note(conversation_id: int, admin_id: int | None, note: str) -> None:
         )
 
 
+def delete_conversation_data(conversation: dict) -> None:
+    user_id = conversation["telegram_user_id"]
+    topic_id = conversation["message_thread_id"]
+    with connect_db() as db:
+        db.execute("DELETE FROM notes WHERE conversation_id = %s", (conversation["id"],))
+        db.execute(
+            """
+            DELETE FROM processed_messages
+            WHERE (direction = 'user_to_admin' AND source_chat_id = %s)
+               OR (direction = 'admin_to_user' AND target_chat_id = %s)
+               OR (source_chat_id = %s AND target_chat_id = %s)
+               OR (source_chat_id = %s AND target_chat_id = %s)
+            """,
+            (user_id, user_id, user_id, ADMIN_GROUP_ID, ADMIN_GROUP_ID, user_id),
+        )
+        db.execute("DELETE FROM conversations WHERE id = %s", (conversation["id"],))
+        remaining = db.execute(
+            "SELECT 1 FROM conversations WHERE telegram_user_id = %s LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if not remaining:
+            db.execute("DELETE FROM username_history WHERE telegram_user_id = %s", (user_id,))
+            db.execute("DELETE FROM users WHERE telegram_user_id = %s", (user_id,))
+        logging.info("Deleted conversation data for user %s topic %s", user_id, topic_id)
+
+
 def unanswered_conversations(cutoff: datetime) -> list[dict]:
     with connect_db() as db:
         return db.execute(
@@ -419,7 +447,7 @@ def topic_id_from_updates(updates) -> int:
 
 
 def command_parts(text: str) -> tuple[str, str] | None:
-    match = re.match(r"^/(close|waiting|note)(?:@\w+)?(?:\s+([\s\S]*))?$", text.strip(), re.I)
+    match = re.match(r"^/(close|waiting|note|delete|confirm_delete|cancel_delete)(?:@\w+)?(?:\s+([\s\S]*))?$", text.strip(), re.I)
     if not match:
         return None
     return f"/{match.group(1).lower()}", match.group(2) or ""
@@ -533,6 +561,22 @@ async def send_profile_message(client: TelegramClient, conversation: dict, user_
     return sent.id
 
 
+async def send_control_panel(client: TelegramClient, conversation: dict) -> int:
+    admin_group = await resolve_admin_group(client)
+    sent = await client.send_message(
+        admin_group,
+        (
+            "\u2699\ufe0f CONVERSATION CONTROLS\n\n"
+            "Delete Conversation: /delete\n\n"
+            "Only authorized admins can use this control."
+        ),
+        reply_to=conversation["message_thread_id"],
+        link_preview=False,
+    )
+    update_conversation(conversation["id"], control_message_id=sent.id)
+    return sent.id
+
+
 async def create_or_replace_profile_message(
     client: TelegramClient,
     conversation: dict,
@@ -591,6 +635,9 @@ async def ensure_conversation(client: TelegramClient, user: types.User, active_a
         if not conversation.get("profile_message_id"):
             user_row = get_user(user.id)
             conversation = await create_or_replace_profile_message(client, conversation, user_row)
+        if not conversation.get("control_message_id"):
+            await send_control_panel(client, conversation)
+            conversation = get_conversation_by_user(user.id)
 
         if conversation["status"] == STATUS_CLOSED and REOPEN_CLOSED_TOPICS:
             if CLOSE_TOPIC_ON_CLOSE:
@@ -620,14 +667,99 @@ async def ensure_conversation(client: TelegramClient, user: types.User, active_a
     conversation = create_conversation(user.id, thread_id, name, active_at)
     user_row = get_user(user.id)
     await send_profile_message(client, conversation, user_row)
+    conversation = get_conversation_by_user(user.id)
+    await send_control_panel(client, conversation)
     await client.send_message(admin_group, f"{ICON_STARTED} New conversation started", reply_to=thread_id)
     return get_conversation_by_user(user.id), True
+
+
+def requested_conversation_id(args: str) -> int | None:
+    args = args.strip()
+    return int(args) if args.isdigit() else None
+
+
+async def send_unauthorized(client: TelegramClient, conversation: dict) -> None:
+    admin_group = await resolve_admin_group(client)
+    await client.send_message(
+        admin_group,
+        "\u26d4 You are not authorized to perform this action.",
+        reply_to=conversation["message_thread_id"],
+    )
+
+
+async def handle_delete_confirmation(client: TelegramClient, conversation: dict) -> None:
+    admin_group = await resolve_admin_group(client)
+    await client.send_message(
+        admin_group,
+        (
+            f"{ICON_WARNING} DELETE CONVERSATION?\n\n"
+            "This will permanently delete:\n\n"
+            "• This forum topic\n"
+            "• All messages in this conversation\n"
+            "• User conversation data\n"
+            "• Username history\n"
+            "• Conversation mappings\n\n"
+            "This action cannot be undone.\n\n"
+            f"Cancel: /cancel_delete {conversation['id']}\n"
+            f"Yes, Delete: /confirm_delete {conversation['id']}"
+        ),
+        reply_to=conversation["message_thread_id"],
+    )
+
+
+async def delete_conversation(client: TelegramClient, conversation: dict) -> None:
+    admin_group = await resolve_admin_group(client)
+    await client.send_message(
+        admin_group,
+        f"{ICON_OK} Conversation deletion started.",
+        reply_to=conversation["message_thread_id"],
+    )
+    try:
+        await client(
+            functions.channels.DeleteTopicHistoryRequest(
+                channel=admin_group,
+                top_msg_id=conversation["message_thread_id"],
+            )
+        )
+    except Exception as error:
+        logging.warning("Could not delete full topic history: %s", safe_error(error))
+
+    delete_conversation_data(conversation)
 
 
 async def handle_admin_command(client: TelegramClient, message, conversation: dict, command: str, args: str) -> None:
     admin_group = await resolve_admin_group(client)
     admin = await message.get_sender()
     admin_id = admin.id if admin else None
+
+    if not admin_id or not admin_allowed(admin_id):
+        await send_unauthorized(client, conversation)
+        return
+
+    if command == "/delete":
+        await handle_delete_confirmation(client, conversation)
+        return
+
+    if command in {"/confirm_delete", "/cancel_delete"}:
+        requested_id = requested_conversation_id(args)
+        if requested_id != conversation["id"]:
+            await client.send_message(
+                admin_group,
+                f"{ICON_FAILED} This delete confirmation does not belong to this topic.",
+                reply_to=conversation["message_thread_id"],
+            )
+            return
+
+        if command == "/cancel_delete":
+            await client.send_message(
+                admin_group,
+                f"{ICON_OK} Delete cancelled.",
+                reply_to=conversation["message_thread_id"],
+            )
+            return
+
+        await delete_conversation(client, conversation)
+        return
 
     if command == "/close":
         update_conversation(conversation["id"], status=STATUS_CLOSED, closed_at=utcnow())
@@ -737,7 +869,7 @@ async def main() -> None:
             return
 
         sender = await event.get_sender()
-        if not sender or not admin_allowed(sender.id):
+        if not sender:
             return
 
         parsed = command_parts(message.raw_text or "")
