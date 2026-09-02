@@ -49,6 +49,7 @@ ICON_OK = "\u2705"
 ICON_WAITING = "\u23f3"
 ICON_RETURNED = "\U0001f504"
 SEPARATOR = "\u2501" * 14
+ADMIN_GROUP_ENTITY = None
 
 
 def utcnow() -> datetime:
@@ -280,10 +281,29 @@ def safe_error(error: Exception) -> str:
     return re.sub(r"\d+:[A-Za-z0-9_-]+", "[hidden]", str(error))
 
 
+async def resolve_admin_group(client: TelegramClient):
+    global ADMIN_GROUP_ENTITY
+    if ADMIN_GROUP_ENTITY is not None:
+        return ADMIN_GROUP_ENTITY
+
+    try:
+        ADMIN_GROUP_ENTITY = await client.get_entity(ADMIN_GROUP_ID)
+    except ValueError:
+        logging.info("Admin group entity was not cached. Loading dialogs once.")
+        await client.get_dialogs(limit=None)
+        ADMIN_GROUP_ENTITY = await client.get_entity(ADMIN_GROUP_ID)
+
+    group_id = getattr(ADMIN_GROUP_ENTITY, "id", None)
+    group_title = getattr(ADMIN_GROUP_ENTITY, "title", None)
+    logging.info("Resolved admin group: %s (%s)", group_title, group_id)
+    return ADMIN_GROUP_ENTITY
+
+
 async def create_topic(client: TelegramClient, user: types.User) -> int:
+    admin_group = await resolve_admin_group(client)
     result = await client(
         functions.channels.CreateForumTopicRequest(
-            channel=ADMIN_GROUP_ID,
+            channel=admin_group,
             title=topic_name(user),
             random_id=random.getrandbits(63),
         )
@@ -310,19 +330,20 @@ async def send_copy(client: TelegramClient, target, source_message, *, reply_to=
 
 
 async def relay_user_to_admin(client: TelegramClient, message, conversation: dict, user: types.User) -> None:
+    admin_group = await resolve_admin_group(client)
     footer = user_footer(user)
     try:
         if message.media:
             sent = await send_copy(
                 client,
-                ADMIN_GROUP_ID,
+                admin_group,
                 message,
                 reply_to=conversation["message_thread_id"],
                 caption=append_footer(message.text, footer),
             )
         else:
             sent = await client.send_message(
-                ADMIN_GROUP_ID,
+                admin_group,
                 append_footer(message.text, footer),
                 reply_to=conversation["message_thread_id"],
                 formatting_entities=message.entities,
@@ -331,7 +352,7 @@ async def relay_user_to_admin(client: TelegramClient, message, conversation: dic
     except Exception as error:
         logging.exception("Failed to copy user message exactly")
         sent = await client.send_message(
-            ADMIN_GROUP_ID,
+            admin_group,
             f"{ICON_WARNING} Could not relay this user message exactly.\n\nReason: {safe_error(error)}\n\n{footer}",
             reply_to=conversation["message_thread_id"],
         )
@@ -340,6 +361,7 @@ async def relay_user_to_admin(client: TelegramClient, message, conversation: dic
 
 
 async def relay_admin_to_user(client: TelegramClient, message, conversation: dict) -> None:
+    admin_group = await resolve_admin_group(client)
     user_id = int(conversation["telegram_user_id"])
     try:
         sent = await send_copy(client, user_id, message)
@@ -347,20 +369,21 @@ async def relay_admin_to_user(client: TelegramClient, message, conversation: dic
     except Exception as error:
         logging.exception("Failed to deliver admin reply")
         await client.send_message(
-            ADMIN_GROUP_ID,
+            admin_group,
             f"{ICON_FAILED} DELIVERY FAILED\n\nUser ID: {user_id}\n\nReason:\n{safe_error(error)}",
             reply_to=conversation["message_thread_id"],
         )
 
 
 async def ensure_conversation(client: TelegramClient, user: types.User) -> dict:
+    admin_group = await resolve_admin_group(client)
     conversation = get_conversation_by_user(user.id)
     if conversation:
         if conversation["status"] == STATUS_CLOSED and REOPEN_CLOSED_TOPICS:
             if CLOSE_TOPIC_ON_CLOSE:
                 await client(
                     functions.channels.EditForumTopicRequest(
-                        channel=ADMIN_GROUP_ID,
+                        channel=admin_group,
                         topic_id=conversation["message_thread_id"],
                         closed=False,
                     )
@@ -373,7 +396,7 @@ async def ensure_conversation(client: TelegramClient, user: types.User) -> dict:
                 unanswered_notified_at=None,
             )
             await client.send_message(
-                ADMIN_GROUP_ID,
+                admin_group,
                 f"{ICON_RETURNED} User returned. Conversation reopened.",
                 reply_to=conversation["message_thread_id"],
             )
@@ -383,21 +406,22 @@ async def ensure_conversation(client: TelegramClient, user: types.User) -> dict:
     name = topic_name(user)
     thread_id = await create_topic(client, user)
     conversation = create_conversation(user.id, thread_id, name)
-    await client.send_message(ADMIN_GROUP_ID, topic_intro(user), reply_to=thread_id)
+    await client.send_message(admin_group, topic_intro(user), reply_to=thread_id)
     return conversation
 
 
 async def handle_admin_command(client: TelegramClient, message, conversation: dict, command: str, args: str) -> None:
+    admin_group = await resolve_admin_group(client)
     admin = await message.get_sender()
     admin_id = admin.id if admin else None
 
     if command == "/close":
         update_conversation(conversation["id"], status=STATUS_CLOSED, closed_at=utcnow())
-        await client.send_message(ADMIN_GROUP_ID, f"{ICON_OK} Conversation closed.", reply_to=conversation["message_thread_id"])
+        await client.send_message(admin_group, f"{ICON_OK} Conversation closed.", reply_to=conversation["message_thread_id"])
         if CLOSE_TOPIC_ON_CLOSE:
             await client(
                 functions.channels.EditForumTopicRequest(
-                    channel=ADMIN_GROUP_ID,
+                    channel=admin_group,
                     topic_id=conversation["message_thread_id"],
                     closed=True,
                 )
@@ -407,17 +431,17 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
     if command == "/take":
         label = f"@{admin.username}" if getattr(admin, "username", None) else user_name(admin, str(admin_id))
         update_conversation(conversation["id"], status=STATUS_IN_PROGRESS, assigned_admin_id=admin_id)
-        await client.send_message(ADMIN_GROUP_ID, f"{ICON_ASSIGNED} Assigned to: {label}", reply_to=conversation["message_thread_id"])
+        await client.send_message(admin_group, f"{ICON_ASSIGNED} Assigned to: {label}", reply_to=conversation["message_thread_id"])
         return
 
     if command == "/release":
         update_conversation(conversation["id"], assigned_admin_id=None)
-        await client.send_message(ADMIN_GROUP_ID, f"{ICON_OK} Assignment released.", reply_to=conversation["message_thread_id"])
+        await client.send_message(admin_group, f"{ICON_OK} Assignment released.", reply_to=conversation["message_thread_id"])
         return
 
     if command == "/waiting":
         update_conversation(conversation["id"], status=STATUS_WAITING_FOR_USER)
-        await client.send_message(ADMIN_GROUP_ID, f"{ICON_WAITING} Status: waiting for user.", reply_to=conversation["message_thread_id"])
+        await client.send_message(admin_group, f"{ICON_WAITING} Status: waiting for user.", reply_to=conversation["message_thread_id"])
         return
 
     if command == "/note":
@@ -425,16 +449,17 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
         if not note:
             return
         add_note(conversation["id"], admin_id, note)
-        await client.send_message(ADMIN_GROUP_ID, f"{ICON_NOTE} INTERNAL NOTE\n\n{note}", reply_to=conversation["message_thread_id"])
+        await client.send_message(admin_group, f"{ICON_NOTE} INTERNAL NOTE\n\n{note}", reply_to=conversation["message_thread_id"])
 
 
 async def unanswered_loop(client: TelegramClient) -> None:
+    admin_group = await resolve_admin_group(client)
     while True:
         await asyncio.sleep(60)
         cutoff = utcnow() - timedelta(minutes=UNANSWERED_TIMEOUT_MINUTES)
         for conversation in unanswered_conversations(cutoff):
             await client.send_message(
-                ADMIN_GROUP_ID,
+                admin_group,
                 f"{ICON_WARNING} UNANSWERED\nWaiting for admin response: {UNANSWERED_TIMEOUT_MINUTES} minutes",
                 reply_to=conversation["message_thread_id"],
             )
@@ -520,6 +545,7 @@ async def main() -> None:
     await client.start()
     me = await client.get_me()
     logging.info("Support userbot running as %s (%s)", getattr(me, "username", None), me.id)
+    await resolve_admin_group(client)
     asyncio.create_task(unanswered_loop(client))
     await client.run_until_disconnected()
 
