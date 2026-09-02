@@ -4,6 +4,7 @@ import os
 import random
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -23,6 +24,7 @@ SESSION_NAME = os.getenv("SESSION_NAME", "support_session")
 SESSION_STRING = os.getenv("TELETHON_SESSION_STRING", "")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
+ADMIN_TIMEZONE = os.getenv("ADMIN_TIMEZONE", "Asia/Manila")
 UNANSWERED_TIMEOUT_MINUTES = int(os.getenv("UNANSWERED_TIMEOUT_MINUTES", "10"))
 REOPEN_CLOSED_TOPICS = os.getenv("REOPEN_CLOSED_TOPICS", "true").lower() == "true"
 CLOSE_TOPIC_ON_CLOSE = os.getenv("CLOSE_TOPIC_ON_CLOSE", "false").lower() == "true"
@@ -40,15 +42,14 @@ STATUS_CLOSED = "CLOSED"
 ICON_USER = "\U0001f464"
 ICON_BADGE = "\U0001f4db"
 ICON_ID = "\U0001f194"
-ICON_CALENDAR = "\U0001f4c5"
-ICON_ASSIGNED = "\U0001f468\u200d\U0001f4bc"
 ICON_NOTE = "\U0001f4dd"
 ICON_WARNING = "\u26a0\ufe0f"
 ICON_FAILED = "\u274c"
 ICON_OK = "\u2705"
 ICON_WAITING = "\u23f3"
 ICON_RETURNED = "\U0001f504"
-SEPARATOR = "\u2501" * 14
+ICON_STARTED = "\u26a1"
+SEPARATOR = "\u2501" * 18
 ADMIN_GROUP_ENTITY = None
 
 
@@ -66,14 +67,36 @@ def init_db() -> None:
     with connect_db() as db:
         db.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+              telegram_user_id BIGINT PRIMARY KEY,
+              display_name TEXT,
+              current_username TEXT,
+              first_contacted TIMESTAMPTZ NOT NULL,
+              last_active TIMESTAMPTZ NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS username_history (
+              id BIGSERIAL PRIMARY KEY,
+              telegram_user_id BIGINT NOT NULL REFERENCES users(telegram_user_id),
+              username TEXT NOT NULL,
+              first_seen_at TIMESTAMPTZ NOT NULL,
+              last_seen_at TIMESTAMPTZ NOT NULL,
+              UNIQUE (telegram_user_id, username)
+            );
+
             CREATE TABLE IF NOT EXISTS conversations (
               id BIGSERIAL PRIMARY KEY,
               telegram_user_id BIGINT NOT NULL UNIQUE,
               admin_group_id BIGINT NOT NULL,
               message_thread_id BIGINT NOT NULL,
+              profile_message_id BIGINT,
               status TEXT NOT NULL DEFAULT 'OPEN',
-              assigned_admin_id BIGINT,
               topic_name TEXT,
+              message_count BIGINT NOT NULL DEFAULT 0,
+              first_contacted TIMESTAMPTZ,
+              last_active TIMESTAMPTZ,
               created_at TIMESTAMPTZ NOT NULL,
               updated_at TIMESTAMPTZ NOT NULL,
               closed_at TIMESTAMPTZ,
@@ -82,6 +105,11 @@ def init_db() -> None:
               unanswered_since TIMESTAMPTZ,
               unanswered_notified_at TIMESTAMPTZ
             );
+
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS profile_message_id BIGINT;
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS message_count BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS first_contacted TIMESTAMPTZ;
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_active TIMESTAMPTZ;
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_topic
               ON conversations (admin_group_id, message_thread_id);
@@ -123,6 +151,18 @@ def claim_message(direction: str, source_chat_id: int, source_message_id: int) -
         return row is not None
 
 
+def unclaim_message(direction: str, source_chat_id: int, source_message_id: int) -> None:
+    with connect_db() as db:
+        db.execute(
+            """
+            DELETE FROM processed_messages
+            WHERE direction = %s AND source_chat_id = %s AND source_message_id = %s
+              AND target_message_id IS NULL
+            """,
+            (direction, source_chat_id, source_message_id),
+        )
+
+
 def mark_message_delivered(
     direction: str,
     source_chat_id: int,
@@ -157,16 +197,87 @@ def get_conversation_by_topic(topic_id: int) -> dict | None:
         ).fetchone()
 
 
-def create_conversation(user_id: int, topic_id: int, name: str) -> dict:
-    timestamp = utcnow()
+def get_user(user_id: int) -> dict | None:
+    with connect_db() as db:
+        return db.execute(
+            "SELECT * FROM users WHERE telegram_user_id = %s",
+            (user_id,),
+        ).fetchone()
+
+
+def get_username_history(user_id: int) -> list[dict]:
+    with connect_db() as db:
+        return db.execute(
+            """
+            SELECT username, first_seen_at, last_seen_at
+            FROM username_history
+            WHERE telegram_user_id = %s
+            ORDER BY last_seen_at DESC, id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+
+
+def remember_previous_username(user_id: int, username: str, seen_at: datetime) -> None:
+    if not username:
+        return
+    with connect_db() as db:
+        db.execute(
+            """
+            INSERT INTO username_history (telegram_user_id, username, first_seen_at, last_seen_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (telegram_user_id, username)
+            DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at
+            """,
+            (user_id, username, seen_at, seen_at),
+        )
+
+
+def sync_user_profile(user: types.User, active_at: datetime) -> dict:
+    user_id = user.id
+    display_name = user_name(user, str(user_id))
+    current_username = user.username or None
+    existing = get_user(user_id)
+
+    with connect_db() as db:
+        if not existing:
+            db.execute(
+                """
+                INSERT INTO users
+                  (telegram_user_id, display_name, current_username, first_contacted,
+                   last_active, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (user_id, display_name, current_username, active_at, active_at, active_at, active_at),
+            )
+            return get_user(user_id)
+
+        old_username = existing["current_username"]
+        if old_username != current_username and old_username:
+            remember_previous_username(user_id, old_username, active_at)
+
+        db.execute(
+            """
+            UPDATE users
+            SET display_name = %s, current_username = %s, last_active = %s, updated_at = %s
+            WHERE telegram_user_id = %s
+            """,
+            (display_name, current_username, active_at, active_at, user_id),
+        )
+
+    return get_user(user_id)
+
+
+def create_conversation(user_id: int, topic_id: int, name: str, active_at: datetime) -> dict:
     with connect_db() as db:
         db.execute(
             """
             INSERT INTO conversations
-              (telegram_user_id, admin_group_id, message_thread_id, status, topic_name, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+              (telegram_user_id, admin_group_id, message_thread_id, status, topic_name,
+               first_contacted, last_active, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (user_id, ADMIN_GROUP_ID, topic_id, STATUS_OPEN, name, timestamp, timestamp),
+            (user_id, ADMIN_GROUP_ID, topic_id, STATUS_OPEN, name, active_at, active_at, active_at, active_at),
         )
     return get_conversation_by_user(user_id)
 
@@ -179,6 +290,28 @@ def update_conversation(conversation_id: int, **fields) -> None:
     values = list(fields.values()) + [conversation_id]
     with connect_db() as db:
         db.execute(f"UPDATE conversations SET {columns} WHERE id = %s", values)
+
+
+def increment_user_message_count(conversation_id: int, active_at: datetime, status: str | None = None) -> dict:
+    assignments = [
+        "message_count = message_count + 1",
+        "last_active = %s",
+        "last_user_message_at = %s",
+        "unanswered_since = %s",
+        "unanswered_notified_at = NULL",
+        "updated_at = %s",
+    ]
+    values = [active_at, active_at, active_at, active_at]
+    if status:
+        assignments.insert(0, "status = %s")
+        values.insert(0, status)
+    values.append(conversation_id)
+
+    with connect_db() as db:
+        return db.execute(
+            f"UPDATE conversations SET {', '.join(assignments)} WHERE id = %s RETURNING *",
+            values,
+        ).fetchone()
 
 
 def add_note(conversation_id: int, admin_id: int | None, note: str) -> None:
@@ -218,37 +351,59 @@ def topic_name(user: types.User) -> str:
     return trim(f"{ICON_USER} {readable} - {handle}", 120)
 
 
-def user_footer(user: types.User) -> str:
-    lines = [
-        SEPARATOR,
-        f"{ICON_USER} {user_name(user, str(user.id))}",
-    ]
-    if user.username:
-        lines.append(f"{ICON_BADGE} @{user.username}")
-    lines.append(f"{ICON_ID} {user.id}")
-    return "\n".join(lines)
-
-
-def topic_intro(user: types.User) -> str:
-    date_format = "%B %#d, %Y" if os.name == "nt" else "%B %-d, %Y"
-    lines = [f"{ICON_USER} {user_name(user, str(user.id))}"]
-    if user.username:
-        lines.append(f"{ICON_BADGE} @{user.username}")
-    lines.extend(
-        [
-            f"{ICON_ID} {user.id}",
-            f"{ICON_CALENDAR} First contact: {datetime.now().strftime(date_format)}",
-        ]
-    )
-    return "\n".join(lines)
-
-
 def trim(value: str, max_length: int) -> str:
     return value if len(value) <= max_length else value[: max_length - 1] + "..."
 
 
-def append_footer(text: str | None, footer: str) -> str:
-    return f"{text}\n\n{footer}" if text else footer
+def format_time(value: datetime | None) -> str:
+    if not value:
+        return "Unknown"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local = value.astimezone(ZoneInfo(ADMIN_TIMEZONE))
+    return local.strftime("%b %-d, %Y %-I:%M %p") if os.name != "nt" else local.strftime("%b %#d, %Y %#I:%M %p")
+
+
+def status_label(status: str) -> str:
+    return {
+        STATUS_OPEN: "\U0001f7e2 Open",
+        STATUS_IN_PROGRESS: "\U0001f7e1 In Progress",
+        STATUS_WAITING_FOR_USER: "\U0001f535 Waiting for User",
+        STATUS_CLOSED: "\U0001f534 Closed",
+    }.get(status, status)
+
+
+def username_label(username: str | None) -> str:
+    return f"@{username}" if username else "None"
+
+
+def profile_card(user_row: dict, conversation: dict) -> str:
+    history = get_username_history(user_row["telegram_user_id"])
+    lines = [
+        SEPARATOR,
+        f"{ICON_USER} USER PROFILE",
+        "",
+        f"Display name: {user_row['display_name'] or user_row['telegram_user_id']}",
+        f"Username: {username_label(user_row['current_username'])}",
+        f"Telegram ID: {user_row['telegram_user_id']}",
+    ]
+
+    if history:
+        lines.extend(["", "Previous usernames:"])
+        lines.extend(f"• {username_label(row['username'])}" for row in history)
+
+    lines.extend(
+        [
+            "",
+            f"First contacted: {format_time(conversation.get('first_contacted') or user_row['first_contacted'])}",
+            f"Last active: {format_time(conversation.get('last_active') or user_row['last_active'])}",
+            "",
+            f"Conversation status: {status_label(conversation['status'])}",
+            f"Message count: {conversation['message_count']}",
+            SEPARATOR,
+        ]
+    )
+    return "\n".join(lines)
 
 
 def topic_id_from_message(message) -> int | None:
@@ -267,7 +422,7 @@ def topic_id_from_updates(updates) -> int:
 
 
 def command_parts(text: str) -> tuple[str, str] | None:
-    match = re.match(r"^/(close|take|release|waiting|note)(?:@\w+)?(?:\s+([\s\S]*))?$", text.strip(), re.I)
+    match = re.match(r"^/(close|waiting|note)(?:@\w+)?(?:\s+([\s\S]*))?$", text.strip(), re.I)
     if not match:
         return None
     return f"/{match.group(1).lower()}", match.group(2) or ""
@@ -279,6 +434,10 @@ def admin_allowed(user_id: int) -> bool:
 
 def safe_error(error: Exception) -> str:
     return re.sub(r"\d+:[A-Za-z0-9_-]+", "[hidden]", str(error))
+
+
+def is_forwarded(message) -> bool:
+    return bool(getattr(message, "fwd_from", None))
 
 
 async def resolve_admin_group(client: TelegramClient):
@@ -311,15 +470,25 @@ async def create_topic(client: TelegramClient, user: types.User) -> int:
     return topic_id_from_updates(result)
 
 
-async def send_copy(client: TelegramClient, target, source_message, *, reply_to=None, caption=None):
+async def send_clean_copy(client: TelegramClient, target, source_message, *, reply_to=None):
+    if is_forwarded(source_message):
+        sent = await client.forward_messages(
+            target,
+            source_message.id,
+            from_peer=source_message.chat_id,
+            silent=True,
+        )
+        return sent[0] if isinstance(sent, list) else sent
+
     if source_message.media:
         return await client.send_file(
             target,
             source_message.media,
-            caption=caption if caption is not None else source_message.text,
+            caption=source_message.text,
             reply_to=reply_to,
             formatting_entities=source_message.entities,
         )
+
     return await client.send_message(
         target,
         source_message.text or "",
@@ -329,31 +498,71 @@ async def send_copy(client: TelegramClient, target, source_message, *, reply_to=
     )
 
 
+async def forward_message(client: TelegramClient, target, source_message, *, top_msg_id=None):
+    result = await client(
+        functions.messages.ForwardMessagesRequest(
+            from_peer=source_message.chat_id,
+            id=[source_message.id],
+            to_peer=target,
+            random_id=[random.getrandbits(63)],
+            silent=True,
+            top_msg_id=top_msg_id,
+        )
+    )
+    for update in getattr(result, "updates", []):
+        sent = getattr(update, "message", None)
+        if isinstance(sent, types.Message):
+            return sent
+    raise RuntimeError("Telegram did not return the forwarded message.")
+
+
+async def forward_to_topic(client: TelegramClient, admin_group, message, topic_id: int):
+    if is_forwarded(message):
+        return await forward_message(client, admin_group, message, top_msg_id=topic_id)
+
+    return await send_clean_copy(client, admin_group, message, reply_to=topic_id)
+
+
+async def send_profile_message(client: TelegramClient, conversation: dict, user_row: dict) -> int:
+    admin_group = await resolve_admin_group(client)
+    sent = await client.send_message(
+        admin_group,
+        profile_card(user_row, conversation),
+        reply_to=conversation["message_thread_id"],
+        link_preview=False,
+    )
+    await client.pin_message(admin_group, sent.id, notify=False)
+    update_conversation(conversation["id"], profile_message_id=sent.id)
+    return sent.id
+
+
+async def update_profile_card(client: TelegramClient, conversation: dict, user_row: dict) -> dict:
+    admin_group = await resolve_admin_group(client)
+    fresh = get_conversation_by_user(conversation["telegram_user_id"])
+    message_id = fresh.get("profile_message_id") if fresh else None
+
+    if not message_id:
+        await send_profile_message(client, fresh, user_row)
+        return get_conversation_by_user(conversation["telegram_user_id"])
+
+    try:
+        await client.edit_message(admin_group, int(message_id), profile_card(user_row, fresh), link_preview=False)
+    except Exception as error:
+        logging.warning("Profile message missing or not editable; creating replacement: %s", safe_error(error))
+        await send_profile_message(client, fresh, user_row)
+
+    return get_conversation_by_user(conversation["telegram_user_id"])
+
+
 async def relay_user_to_admin(client: TelegramClient, message, conversation: dict, user: types.User) -> None:
     admin_group = await resolve_admin_group(client)
-    footer = user_footer(user)
     try:
-        if message.media:
-            sent = await send_copy(
-                client,
-                admin_group,
-                message,
-                reply_to=conversation["message_thread_id"],
-                caption=append_footer(message.text, footer),
-            )
-        else:
-            sent = await client.send_message(
-                admin_group,
-                append_footer(message.text, footer),
-                reply_to=conversation["message_thread_id"],
-                formatting_entities=message.entities,
-                link_preview=False,
-            )
+        sent = await forward_to_topic(client, admin_group, message, conversation["message_thread_id"])
     except Exception as error:
-        logging.exception("Failed to copy user message exactly")
+        logging.exception("Failed to relay user message")
         sent = await client.send_message(
             admin_group,
-            f"{ICON_WARNING} Could not relay this user message exactly.\n\nReason: {safe_error(error)}\n\n{footer}",
+            f"{ICON_WARNING} Could not relay this user message.\n\nReason: {safe_error(error)}",
             reply_to=conversation["message_thread_id"],
         )
 
@@ -364,7 +573,7 @@ async def relay_admin_to_user(client: TelegramClient, message, conversation: dic
     admin_group = await resolve_admin_group(client)
     user_id = int(conversation["telegram_user_id"])
     try:
-        sent = await send_copy(client, user_id, message)
+        sent = await send_clean_copy(client, user_id, message)
         mark_message_delivered("admin_to_user", ADMIN_GROUP_ID, message.id, user_id, sent.id)
     except Exception as error:
         logging.exception("Failed to deliver admin reply")
@@ -375,7 +584,7 @@ async def relay_admin_to_user(client: TelegramClient, message, conversation: dic
         )
 
 
-async def ensure_conversation(client: TelegramClient, user: types.User) -> dict:
+async def ensure_conversation(client: TelegramClient, user: types.User, active_at: datetime) -> tuple[dict, bool]:
     admin_group = await resolve_admin_group(client)
     conversation = get_conversation_by_user(user.id)
     if conversation:
@@ -392,22 +601,23 @@ async def ensure_conversation(client: TelegramClient, user: types.User) -> dict:
                 conversation["id"],
                 status=STATUS_OPEN,
                 closed_at=None,
-                unanswered_since=utcnow(),
                 unanswered_notified_at=None,
             )
             await client.send_message(
                 admin_group,
-                f"{ICON_RETURNED} User returned. Conversation reopened.",
+                f"{ICON_RETURNED} User returned after conversation was closed.\n{ICON_RETURNED} Conversation reopened.",
                 reply_to=conversation["message_thread_id"],
             )
-            return get_conversation_by_user(user.id)
-        return conversation
+            return get_conversation_by_user(user.id), False
+        return conversation, False
 
     name = topic_name(user)
     thread_id = await create_topic(client, user)
-    conversation = create_conversation(user.id, thread_id, name)
-    await client.send_message(admin_group, topic_intro(user), reply_to=thread_id)
-    return conversation
+    conversation = create_conversation(user.id, thread_id, name, active_at)
+    user_row = get_user(user.id)
+    await send_profile_message(client, conversation, user_row)
+    await client.send_message(admin_group, f"{ICON_STARTED} New conversation started", reply_to=thread_id)
+    return get_conversation_by_user(user.id), True
 
 
 async def handle_admin_command(client: TelegramClient, message, conversation: dict, command: str, args: str) -> None:
@@ -417,6 +627,9 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
 
     if command == "/close":
         update_conversation(conversation["id"], status=STATUS_CLOSED, closed_at=utcnow())
+        fresh = get_conversation_by_user(conversation["telegram_user_id"])
+        user_row = get_user(conversation["telegram_user_id"])
+        await update_profile_card(client, fresh, user_row)
         await client.send_message(admin_group, f"{ICON_OK} Conversation closed.", reply_to=conversation["message_thread_id"])
         if CLOSE_TOPIC_ON_CLOSE:
             await client(
@@ -428,19 +641,11 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
             )
         return
 
-    if command == "/take":
-        label = f"@{admin.username}" if getattr(admin, "username", None) else user_name(admin, str(admin_id))
-        update_conversation(conversation["id"], status=STATUS_IN_PROGRESS, assigned_admin_id=admin_id)
-        await client.send_message(admin_group, f"{ICON_ASSIGNED} Assigned to: {label}", reply_to=conversation["message_thread_id"])
-        return
-
-    if command == "/release":
-        update_conversation(conversation["id"], assigned_admin_id=None)
-        await client.send_message(admin_group, f"{ICON_OK} Assignment released.", reply_to=conversation["message_thread_id"])
-        return
-
     if command == "/waiting":
         update_conversation(conversation["id"], status=STATUS_WAITING_FOR_USER)
+        fresh = get_conversation_by_user(conversation["telegram_user_id"])
+        user_row = get_user(conversation["telegram_user_id"])
+        await update_profile_card(client, fresh, user_row)
         await client.send_message(admin_group, f"{ICON_WAITING} Status: waiting for user.", reply_to=conversation["message_thread_id"])
         return
 
@@ -500,15 +705,18 @@ async def main() -> None:
         if not claim_message("user_to_admin", sender.id, event.message.id):
             return
 
-        conversation = await ensure_conversation(client, sender)
-        await relay_user_to_admin(client, event.message, conversation, sender)
-        update_conversation(
-            conversation["id"],
-            status=STATUS_OPEN if conversation["status"] in (STATUS_CLOSED, STATUS_WAITING_FOR_USER) else conversation["status"],
-            last_user_message_at=utcnow(),
-            unanswered_since=utcnow(),
-            unanswered_notified_at=None,
-        )
+        active_at = utcnow()
+        try:
+            user_row = sync_user_profile(sender, active_at)
+            conversation, _is_new = await ensure_conversation(client, sender, active_at)
+            next_status = STATUS_OPEN if conversation["status"] in (STATUS_CLOSED, STATUS_WAITING_FOR_USER) else conversation["status"]
+            conversation = increment_user_message_count(conversation["id"], active_at, next_status)
+            user_row = get_user(sender.id)
+            conversation = await update_profile_card(client, conversation, user_row)
+            await relay_user_to_admin(client, event.message, conversation, sender)
+        except Exception:
+            unclaim_message("user_to_admin", sender.id, event.message.id)
+            raise
 
     @client.on(events.NewMessage(chats=ADMIN_GROUP_ID, incoming=True))
     async def on_admin_topic_message(event):
@@ -522,6 +730,9 @@ async def main() -> None:
         if not conversation:
             return
 
+        if conversation.get("profile_message_id") and message.id == int(conversation["profile_message_id"]):
+            return
+
         sender = await event.get_sender()
         if not sender or not admin_allowed(sender.id):
             return
@@ -533,14 +744,22 @@ async def main() -> None:
 
         if not claim_message("admin_to_user", ADMIN_GROUP_ID, message.id):
             return
-        await relay_admin_to_user(client, message, conversation)
-        update_conversation(
-            conversation["id"],
-            status=STATUS_IN_PROGRESS if conversation["status"] == STATUS_OPEN else conversation["status"],
-            last_admin_message_at=utcnow(),
-            unanswered_since=None,
-            unanswered_notified_at=None,
-        )
+        try:
+            await relay_admin_to_user(client, message, conversation)
+            next_status = STATUS_IN_PROGRESS if conversation["status"] == STATUS_OPEN else conversation["status"]
+            update_conversation(
+                conversation["id"],
+                status=next_status,
+                last_admin_message_at=utcnow(),
+                unanswered_since=None,
+                unanswered_notified_at=None,
+            )
+            fresh = get_conversation_by_user(conversation["telegram_user_id"])
+            user_row = get_user(conversation["telegram_user_id"])
+            await update_profile_card(client, fresh, user_row)
+        except Exception:
+            unclaim_message("admin_to_user", ADMIN_GROUP_ID, message.id)
+            raise
 
     await client.start()
     me = await client.get_me()

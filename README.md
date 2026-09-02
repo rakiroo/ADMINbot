@@ -36,6 +36,7 @@ TG_API_HASH=your_api_hash_here
 ADMIN_GROUP_ID=-1001234567890
 ADMIN_IDS=111111111,222222222
 DATABASE_URL=postgresql://username:password@host:5432/database
+ADMIN_TIMEZONE=Asia/Manila
 ```
 
 `ADMIN_IDS` is optional. If left empty, anyone who can post inside a user topic can relay messages to users. For production, set it to your admin Telegram user IDs.
@@ -88,6 +89,7 @@ ADMIN_GROUP_ID
 ADMIN_IDS
 TELETHON_SESSION_STRING
 DATABASE_URL
+ADMIN_TIMEZONE
 UNANSWERED_TIMEOUT_MINUTES
 REOPEN_CLOSED_TOPICS
 CLOSE_TOPIC_ON_CLOSE
@@ -142,8 +144,6 @@ You can also open the Worker URL manually; it will ping Render once and return t
 Use these inside a user's forum topic:
 
 ```text
-/take
-/release
 /waiting
 /close
 /note User is waiting for payment confirmation.
@@ -156,7 +156,9 @@ Notes stay inside the admin topic and are never sent to the user.
 - New user message creates a forum topic if needed.
 - Existing users reuse their existing topic.
 - Closed conversations reopen when the user messages again.
-- User messages get sender info added only on the admin side.
+- User messages remain clean in the admin topic.
+- User identity lives in a pinned profile card that updates over time.
+- Username changes are kept in permanent history.
 - Admin replies are copied back to the user without admin-group metadata.
 - Duplicate source messages are ignored through the `processed_messages` table.
 - Delivery failures are reported inside the user's admin topic.
@@ -167,8 +169,9 @@ Notes stay inside the admin topic and are never sent to the user.
 The implementation uses Telethon and MTProto methods/events:
 
 - `events.NewMessage` for incoming private messages and admin-topic messages.
-- `messages.CreateForumTopicRequest` for creating topics.
+- `channels.CreateForumTopicRequest` for creating topics.
 - `send_message` with topic reply targeting for topic text.
 - `send_file` for media copies where Telethon supports the message media.
+- `messages.ForwardMessagesRequest` for forwarded messages where forwarding context should be preserved.
 
 Telegram and Telethon do not guarantee that every possible exotic Telegram message can be copied perfectly without forwarding metadata. The code attempts to copy media without visible forwarding information and reports failures in the admin topic instead of silently losing messages.

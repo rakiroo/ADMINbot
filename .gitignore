@@ -4,5 +4,7 @@
 *.sqlite3
 *.sqlite3-journal
 .venv/
+.wrangler/
+keepalive-worker/.wrangler/
 __pycache__/
 *.pyc
