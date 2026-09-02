@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: telegram-userbot-support-relay
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python support_userbot.py
+    envVars:
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: ADMIN_GROUP_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: TELETHON_SESSION_STRING
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: UNANSWERED_TIMEOUT_MINUTES
+        value: "10"
+      - key: REOPEN_CLOSED_TOPICS
+        value: "true"
+      - key: CLOSE_TOPIC_ON_CLOSE
+        value: "false"
