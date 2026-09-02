@@ -108,7 +108,7 @@ Opening the Render URL wakes the service if it has gone to sleep.
 
 ## Keep Render Awake With Cloudflare Cron
 
-The `keepalive-worker/` folder contains a tiny Cloudflare Worker that calls your Render `/health` URL every 13 minutes.
+The `keepalive-worker/` folder contains a tiny Cloudflare Worker that calls your Render `/health` URL every 10 minutes.
 
 After your Render service is deployed and you have its URL:
 
@@ -132,7 +132,7 @@ https://your-render-service.onrender.com/health
 The cron schedule is in `keepalive-worker/wrangler.toml`:
 
 ```text
-*/13 0-17,22-23 * * *
+*/10 0-17,22-23 * * *
 ```
 
 Cloudflare cron uses UTC. This schedule skips 18:00-21:59 UTC, which is 2:00 AM-5:59 AM in Manila. Pinging resumes at 6:00 AM Manila.

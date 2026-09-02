@@ -3,7 +3,7 @@ main = "src/worker.js"
 compatibility_date = "2026-09-02"
 
 [triggers]
-crons = ["*/13 0-17,22-23 * * *"]
+crons = ["*/10 0-17,22-23 * * *"]
 
 [vars]
 TARGET_URL = "https://your-render-app.onrender.com/health"
