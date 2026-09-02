@@ -94,7 +94,6 @@ def init_db() -> None:
               profile_message_id BIGINT,
               status TEXT NOT NULL DEFAULT 'OPEN',
               topic_name TEXT,
-              message_count BIGINT NOT NULL DEFAULT 0,
               first_contacted TIMESTAMPTZ,
               last_active TIMESTAMPTZ,
               created_at TIMESTAMPTZ NOT NULL,
@@ -107,7 +106,6 @@ def init_db() -> None:
             );
 
             ALTER TABLE conversations ADD COLUMN IF NOT EXISTS profile_message_id BIGINT;
-            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS message_count BIGINT NOT NULL DEFAULT 0;
             ALTER TABLE conversations ADD COLUMN IF NOT EXISTS first_contacted TIMESTAMPTZ;
             ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_active TIMESTAMPTZ;
 
@@ -233,11 +231,12 @@ def remember_previous_username(user_id: int, username: str, seen_at: datetime) -
         )
 
 
-def sync_user_profile(user: types.User, active_at: datetime) -> dict:
+def sync_user_profile(user: types.User, active_at: datetime) -> tuple[dict, bool]:
     user_id = user.id
     display_name = user_name(user, str(user_id))
     current_username = user.username or None
     existing = get_user(user_id)
+    username_changed = False
 
     with connect_db() as db:
         if not existing:
@@ -250,22 +249,22 @@ def sync_user_profile(user: types.User, active_at: datetime) -> dict:
                 """,
                 (user_id, display_name, current_username, active_at, active_at, active_at, active_at),
             )
-            return get_user(user_id)
+        else:
+            old_username = existing["current_username"]
+            username_changed = old_username != current_username
+            if username_changed and old_username:
+                remember_previous_username(user_id, old_username, active_at)
 
-        old_username = existing["current_username"]
-        if old_username != current_username and old_username:
-            remember_previous_username(user_id, old_username, active_at)
+            db.execute(
+                """
+                UPDATE users
+                SET display_name = %s, current_username = %s, last_active = %s, updated_at = %s
+                WHERE telegram_user_id = %s
+                """,
+                (display_name, current_username, active_at, active_at, user_id),
+            )
 
-        db.execute(
-            """
-            UPDATE users
-            SET display_name = %s, current_username = %s, last_active = %s, updated_at = %s
-            WHERE telegram_user_id = %s
-            """,
-            (display_name, current_username, active_at, active_at, user_id),
-        )
-
-    return get_user(user_id)
+    return get_user(user_id), username_changed
 
 
 def create_conversation(user_id: int, topic_id: int, name: str, active_at: datetime) -> dict:
@@ -292,9 +291,8 @@ def update_conversation(conversation_id: int, **fields) -> None:
         db.execute(f"UPDATE conversations SET {columns} WHERE id = %s", values)
 
 
-def increment_user_message_count(conversation_id: int, active_at: datetime, status: str | None = None) -> dict:
+def record_user_activity(conversation_id: int, active_at: datetime, status: str | None = None) -> dict:
     assignments = [
-        "message_count = message_count + 1",
         "last_active = %s",
         "last_user_message_at = %s",
         "unanswered_since = %s",
@@ -399,7 +397,6 @@ def profile_card(user_row: dict, conversation: dict) -> str:
             f"Last active: {format_time(conversation.get('last_active') or user_row['last_active'])}",
             "",
             f"Conversation status: {status_label(conversation['status'])}",
-            f"Message count: {conversation['message_count']}",
             SEPARATOR,
         ]
     )
@@ -536,21 +533,24 @@ async def send_profile_message(client: TelegramClient, conversation: dict, user_
     return sent.id
 
 
-async def update_profile_card(client: TelegramClient, conversation: dict, user_row: dict) -> dict:
+async def create_or_replace_profile_message(
+    client: TelegramClient,
+    conversation: dict,
+    user_row: dict,
+    *,
+    unpin_previous: bool = False,
+) -> dict:
     admin_group = await resolve_admin_group(client)
     fresh = get_conversation_by_user(conversation["telegram_user_id"])
-    message_id = fresh.get("profile_message_id") if fresh else None
+    old_message_id = fresh.get("profile_message_id") if fresh else None
 
-    if not message_id:
-        await send_profile_message(client, fresh, user_row)
-        return get_conversation_by_user(conversation["telegram_user_id"])
+    if unpin_previous and old_message_id:
+        try:
+            await client.unpin_message(admin_group, int(old_message_id), notify=False)
+        except Exception as error:
+            logging.warning("Could not unpin previous profile message: %s", safe_error(error))
 
-    try:
-        await client.edit_message(admin_group, int(message_id), profile_card(user_row, fresh), link_preview=False)
-    except Exception as error:
-        logging.warning("Profile message missing or not editable; creating replacement: %s", safe_error(error))
-        await send_profile_message(client, fresh, user_row)
-
+    await send_profile_message(client, fresh, user_row)
     return get_conversation_by_user(conversation["telegram_user_id"])
 
 
@@ -588,6 +588,10 @@ async def ensure_conversation(client: TelegramClient, user: types.User, active_a
     admin_group = await resolve_admin_group(client)
     conversation = get_conversation_by_user(user.id)
     if conversation:
+        if not conversation.get("profile_message_id"):
+            user_row = get_user(user.id)
+            conversation = await create_or_replace_profile_message(client, conversation, user_row)
+
         if conversation["status"] == STATUS_CLOSED and REOPEN_CLOSED_TOPICS:
             if CLOSE_TOPIC_ON_CLOSE:
                 await client(
@@ -627,9 +631,6 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
 
     if command == "/close":
         update_conversation(conversation["id"], status=STATUS_CLOSED, closed_at=utcnow())
-        fresh = get_conversation_by_user(conversation["telegram_user_id"])
-        user_row = get_user(conversation["telegram_user_id"])
-        await update_profile_card(client, fresh, user_row)
         await client.send_message(admin_group, f"{ICON_OK} Conversation closed.", reply_to=conversation["message_thread_id"])
         if CLOSE_TOPIC_ON_CLOSE:
             await client(
@@ -643,9 +644,6 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
 
     if command == "/waiting":
         update_conversation(conversation["id"], status=STATUS_WAITING_FOR_USER)
-        fresh = get_conversation_by_user(conversation["telegram_user_id"])
-        user_row = get_user(conversation["telegram_user_id"])
-        await update_profile_card(client, fresh, user_row)
         await client.send_message(admin_group, f"{ICON_WAITING} Status: waiting for user.", reply_to=conversation["message_thread_id"])
         return
 
@@ -707,12 +705,17 @@ async def main() -> None:
 
         active_at = utcnow()
         try:
-            user_row = sync_user_profile(sender, active_at)
+            user_row, username_changed = sync_user_profile(sender, active_at)
             conversation, _is_new = await ensure_conversation(client, sender, active_at)
             next_status = STATUS_OPEN if conversation["status"] in (STATUS_CLOSED, STATUS_WAITING_FOR_USER) else conversation["status"]
-            conversation = increment_user_message_count(conversation["id"], active_at, next_status)
-            user_row = get_user(sender.id)
-            conversation = await update_profile_card(client, conversation, user_row)
+            conversation = record_user_activity(conversation["id"], active_at, next_status)
+            if username_changed:
+                conversation = await create_or_replace_profile_message(
+                    client,
+                    conversation,
+                    user_row,
+                    unpin_previous=True,
+                )
             await relay_user_to_admin(client, event.message, conversation, sender)
         except Exception:
             unclaim_message("user_to_admin", sender.id, event.message.id)
@@ -754,9 +757,6 @@ async def main() -> None:
                 unanswered_since=None,
                 unanswered_notified_at=None,
             )
-            fresh = get_conversation_by_user(conversation["telegram_user_id"])
-            user_row = get_user(conversation["telegram_user_id"])
-            await update_profile_card(client, fresh, user_row)
         except Exception:
             unclaim_message("admin_to_user", ADMIN_GROUP_ID, message.id)
             raise
