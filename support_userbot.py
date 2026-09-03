@@ -558,6 +558,12 @@ async def send_profile_message(client: TelegramClient, conversation: dict, user_
     )
     await client.pin_message(admin_group, sent.id, notify=False)
     update_conversation(conversation["id"], profile_message_id=sent.id)
+    logging.info(
+        "Pinned profile message %s for user %s in topic %s",
+        sent.id,
+        conversation["telegram_user_id"],
+        conversation["message_thread_id"],
+    )
     return sent.id
 
 
@@ -665,6 +671,7 @@ async def ensure_conversation(client: TelegramClient, user: types.User, active_a
     name = topic_name(user)
     thread_id = await create_topic(client, user)
     conversation = create_conversation(user.id, thread_id, name, active_at)
+    logging.info("Created new conversation topic %s for user %s", thread_id, user.id)
     user_row = get_user(user.id)
     await send_profile_message(client, conversation, user_row)
     conversation = get_conversation_by_user(user.id)
