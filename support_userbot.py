@@ -132,8 +132,41 @@ def init_db() -> None:
               note TEXT NOT NULL,
               created_at TIMESTAMPTZ NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL
+            );
+
+            INSERT INTO settings (key, value, updated_at)
+            VALUES ('support_enabled', 'true', NOW())
+            ON CONFLICT (key) DO NOTHING;
             """
         )
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with connect_db() as db:
+        row = db.execute("SELECT value FROM settings WHERE key = %s", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with connect_db() as db:
+        db.execute(
+            """
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (key)
+            DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+            """,
+            (key, value, utcnow()),
+        )
+
+
+def support_enabled() -> bool:
+    return get_setting("support_enabled", "true") == "true"
 
 
 def claim_message(direction: str, source_chat_id: int, source_message_id: int) -> bool:
@@ -447,7 +480,11 @@ def topic_id_from_updates(updates) -> int:
 
 
 def command_parts(text: str) -> tuple[str, str] | None:
-    match = re.match(r"^/(close|waiting|note|delete|confirm_delete|cancel_delete)(?:@\w+)?(?:\s+([\s\S]*))?$", text.strip(), re.I)
+    match = re.match(
+        r"^/(close|waiting|note|delete|d|confirm_delete|y|cancel_delete|n|support_on|on|support_off|off|support_status)(?:@\w+)?(?:\s+([\s\S]*))?$",
+        text.strip(),
+        re.I,
+    )
     if not match:
         return None
     return f"/{match.group(1).lower()}", match.group(2) or ""
@@ -573,7 +610,10 @@ async def send_control_panel(client: TelegramClient, conversation: dict) -> int:
         admin_group,
         (
             "\u2699\ufe0f CONVERSATION CONTROLS\n\n"
-            "Delete Conversation: /delete\n\n"
+            "Delete Conversation: /d\n\n"
+            "Support On: /on\n"
+            "Support Off: /off\n"
+            "Support Status: /support_status\n\n"
             "Only authorized admins can use this control."
         ),
         reply_to=conversation["message_thread_id"],
@@ -707,8 +747,8 @@ async def handle_delete_confirmation(client: TelegramClient, conversation: dict)
             "• Username history\n"
             "• Conversation mappings\n\n"
             "This action cannot be undone.\n\n"
-            f"Cancel: /cancel_delete {conversation['id']}\n"
-            f"Yes, Delete: /confirm_delete {conversation['id']}"
+            f"Cancel: /n {conversation['id']}\n"
+            f"Yes, Delete: /y {conversation['id']}"
         ),
         reply_to=conversation["message_thread_id"],
     )
@@ -743,11 +783,11 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
         await send_unauthorized(client, conversation)
         return
 
-    if command == "/delete":
+    if command in {"/delete", "/d"}:
         await handle_delete_confirmation(client, conversation)
         return
 
-    if command in {"/confirm_delete", "/cancel_delete"}:
+    if command in {"/confirm_delete", "/cancel_delete", "/y", "/n"}:
         requested_id = requested_conversation_id(args)
         if requested_id != conversation["id"]:
             await client.send_message(
@@ -757,7 +797,7 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
             )
             return
 
-        if command == "/cancel_delete":
+        if command in {"/cancel_delete", "/n"}:
             await client.send_message(
                 admin_group,
                 f"{ICON_OK} Delete cancelled.",
@@ -792,6 +832,50 @@ async def handle_admin_command(client: TelegramClient, message, conversation: di
             return
         add_note(conversation["id"], admin_id, note)
         await client.send_message(admin_group, f"{ICON_NOTE} INTERNAL NOTE\n\n{note}", reply_to=conversation["message_thread_id"])
+
+
+async def handle_global_admin_command(client: TelegramClient, message, command: str) -> bool:
+    admin_group = await resolve_admin_group(client)
+    sender = await message.get_sender()
+    if not sender:
+        return True
+
+    if not admin_allowed(sender.id):
+        await client.send_message(
+            admin_group,
+            "\u26d4 You are not authorized to perform this action.",
+            reply_to=topic_id_from_message(message),
+        )
+        return True
+
+    if command in {"/support_off", "/off"}:
+        set_setting("support_enabled", "false")
+        await client.send_message(
+            admin_group,
+            f"{ICON_OK} Support relay is now OFF. Buyer messages will not be forwarded until /support_on.",
+            reply_to=topic_id_from_message(message),
+        )
+        return True
+
+    if command in {"/support_on", "/on"}:
+        set_setting("support_enabled", "true")
+        await client.send_message(
+            admin_group,
+            f"{ICON_OK} Support relay is now ON.",
+            reply_to=topic_id_from_message(message),
+        )
+        return True
+
+    if command == "/support_status":
+        state = "ON" if support_enabled() else "OFF"
+        await client.send_message(
+            admin_group,
+            f"Support relay status: {state}",
+            reply_to=topic_id_from_message(message),
+        )
+        return True
+
+    return False
 
 
 async def unanswered_loop(client: TelegramClient) -> None:
@@ -839,6 +923,9 @@ async def main() -> None:
         sender = await event.get_sender()
         if not isinstance(sender, types.User) or sender.bot:
             return
+        if not support_enabled():
+            logging.info("Support relay is off; ignored private message %s from %s", event.message.id, sender.id)
+            return
         if not claim_message("user_to_admin", sender.id, event.message.id):
             return
 
@@ -865,6 +952,11 @@ async def main() -> None:
         message = event.message
         if getattr(message, "action", None):
             return
+        parsed = command_parts(message.raw_text or "")
+        if parsed and parsed[0] in {"/support_on", "/support_off", "/support_status"}:
+            await handle_global_admin_command(client, message, parsed[0])
+            return
+
         topic_id = topic_id_from_message(message)
         if not topic_id:
             return
@@ -879,7 +971,6 @@ async def main() -> None:
         if not sender:
             return
 
-        parsed = command_parts(message.raw_text or "")
         if parsed:
             await handle_admin_command(client, message, conversation, parsed[0], parsed[1])
             return
